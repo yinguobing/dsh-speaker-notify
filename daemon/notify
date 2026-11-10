@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""notify —— 让客厅喇叭说话的命令行。给 bash 用，给 agent 用，给自己用。
+
+  notify "任务完成"                     # 说一句话
+  notify --volume 30 "小声点"           # 临时压低
+  notify --kind test "自检"             # 不落 notify 日志的测试音
+  notify --sink local "在音箱上小声说"   # 只走本机声卡（不给客厅听）
+  notify --sink living "只客厅"          # 只走客厅音箱（默认）
+  notify --mode log-only --reason quiet "只记不念"
+  notify presence [--json]              # 键鼠空闲多久（测量，不做决定）
+  notify-run --label "转 mcap" -- make  # 跑命令，结束时自动播报结果（成功/失败/被杀）
+  notify-status                         # 守护进程活着吗
+  notify-log [-n 20]                    # 最近的播报记录
+
+依赖常驻进程 speakd（热着 TTS 模型）；第一次调用会自动拉起来，冷启动约 7 秒。
+"""
+import json
+import os
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SOCKET = os.environ.get("SPEAKD_SOCKET", f"/run/user/{os.getuid()}/speakd.sock")
+HERE = Path(__file__).resolve().parent
+DAEMON = HERE / "speakd.py"
+# speakd 需要装好 TTS 依赖的 Python；CLI 自己只用标准库。
+# 优先级：SPEAKD_PYTHON → ~/.venvs/speakd/bin/python → 当前解释器
+def _daemon_python() -> str:
+    env = os.environ.get("SPEAKD_PYTHON")
+    if env:
+        return env
+    candidate = Path.home() / ".venvs/speakd/bin/python"
+    return str(candidate) if candidate.exists() else sys.executable
+
+
+PYTHON = _daemon_python()
+LOG = Path.home() / ".local/state/speakd/notify.log"
+
+
+def _send(payload: dict, timeout: float = 60.0) -> dict:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCKET)
+        s.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data.decode("utf-8"))
+    finally:
+        s.close()
+
+
+def ensure_daemon(wait: float = 40.0) -> None:
+    if os.path.exists(SOCKET):
+        try:
+            _send({"text": "", "probe": True}, timeout=1.0)
+            return
+        except Exception:
+            pass  # socket 在但没人应答：可能是残留，交给 speakd 自己清理
+    # 守护进程的输出落文件，不然出问题只能靠猜
+    log_dir = Path.home() / ".local/state/speakd"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out = (log_dir / "speakd.out").open("a", encoding="utf-8")
+    subprocess.Popen(
+        [PYTHON, str(DAEMON)],
+        stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+        start_new_session=True, cwd=str(HERE),
+    )
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        try:
+            _send({"text": "", "probe": True}, timeout=0.5)
+            return
+        except Exception:
+            time.sleep(0.3)
+    raise SystemExit("speakd 没能起来，看看 ~/.local/state/speakd/ 下的日志")
+
+
+def cmd_notify(argv: list[str]) -> int:
+    volume = None
+    kind = "notify"
+    voice = None
+    sink = "living"
+    mode = "speak"
+    reason = None
+    fallback = False
+    args = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--volume", "-v"):
+            volume = int(argv[i + 1]); i += 2
+        elif a == "--voice":
+            voice = argv[i + 1]; i += 2
+        elif a == "--kind":
+            kind = argv[i + 1]; i += 2
+        elif a == "--sink":
+            sink = argv[i + 1]; i += 2
+        elif a == "--mode":
+            mode = argv[i + 1]; i += 2
+        elif a == "--reason":
+            reason = argv[i + 1]; i += 2
+        elif a == "--fallback":
+            fallback = True; i += 1
+        elif a in ("--help", "-h"):
+            print(__doc__); return 0
+        else:
+            args.append(a); i += 1
+    text = " ".join(args).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+    if not text:
+        print("没给文本", file=sys.stderr)
+        return 2
+    ensure_daemon()
+    payload = {"text": text, "kind": kind, "sink": sink, "mode": mode, "fallback": fallback}
+    if reason:
+        payload["reason"] = reason
+    if volume is not None:
+        payload["volume"] = volume
+    if voice:
+        payload["voice"] = voice
+    if sink:
+        payload["sink"] = sink
+    resp = _send(payload)
+    if not resp.get("ok"):
+        print(f"播报失败：{resp.get('error')}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _fmt(seconds: float) -> str:
+    s = int(round(seconds))
+    if s < 1:
+        return "不到 1 秒"
+    if s < 60:
+        return f"{s} 秒"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m} 分 {s} 秒" if s else f"{m} 分钟"
+    h, m = divmod(m, 60)
+    return f"{h} 小时 {m} 分"
+
+
+def cmd_run(argv: list[str]) -> int:
+    label = "任务"
+    volume = None
+    sep = argv.index("--") if "--" in argv else -1
+    if sep == -1:
+        print("用法：notify-run --label 名字 [--volume N] -- 命令 ...", file=sys.stderr)
+        return 2
+    opts, cmd = argv[:sep], argv[sep + 1:]
+    i = 0
+    while i < len(opts):
+        if opts[i] == "--label":
+            label = opts[i + 1]; i += 2
+        elif opts[i] in ("--volume", "-v"):
+            volume = int(opts[i + 1]); i += 2
+        else:
+            i += 1
+    if not cmd:
+        print("没给命令", file=sys.stderr)
+        return 2
+
+    t0 = time.time()
+    code = None
+    proc = subprocess.Popen(cmd)
+    try:
+        code = proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        code = proc.wait()
+        result = f"{label}被中断，耗时 {_fmt(time.time()-t0)}"
+        _say_safe(result, volume)
+        return 130
+
+    elapsed = _fmt(time.time() - t0)
+    if code == 0:
+        result = f"{label}完成，耗时 {elapsed}"
+    else:
+        result = f"{label}出错了，退出码 {code}，耗时 {elapsed}"
+    _say_safe(result, volume)
+    return code
+
+
+def _say_safe(text: str, volume: int | None) -> None:
+    try:
+        ensure_daemon()
+        payload = {"text": text}
+        if volume is not None:
+            payload["volume"] = volume
+        _send(payload)
+    except SystemExit as e:
+        print(f"[notify] 播报失败：{e}", file=sys.stderr)
+    except Exception as e:  # 不能让播报失败掩盖命令本身的退出码
+        print(f"[notify] 播报异常：{e!r}", file=sys.stderr)
+
+
+def cmd_presence(argv: list[str]) -> int:
+    try:
+        resp = _send({"probe_presence": True}, timeout=10)
+    except Exception as e:
+        if "--json" in argv:
+            print(json.dumps({"ok": False, "error": repr(e)}))
+        else:
+            print(f"问不到 speakd：{e!r}")
+        return 1
+    if "--json" in argv:
+        print(json.dumps(resp, ensure_ascii=False))
+        return 0
+    d = resp.get("detail", {})
+    names = {"present": "在电脑前", "away": "走开了", "unknown": "测不到"}
+    print(f"判定：{names.get(resp.get('presence'), resp.get('presence'))}")
+    print(f"依据：{d}")
+    return 0
+
+
+def cmd_status() -> int:
+    if not os.path.exists(SOCKET):
+        print(f"speakd 没在跑（{SOCKET} 不存在）")
+        return 1
+    try:
+        _send({"text": "", "probe": True}, timeout=2.0)
+        print(f"speakd 在跑，socket={SOCKET}")
+        return 0
+    except Exception as e:
+        print(f"speakd socket 在但不应答：{e!r}")
+        return 1
+
+
+def cmd_log(argv: list[str]) -> int:
+    n = 20
+    if len(argv) >= 2 and argv[0] in ("-n", "--lines"):
+        n = int(argv[1])
+    if not LOG.exists():
+        print("还没有播报记录")
+        return 0
+    lines = LOG.read_text(encoding="utf-8").splitlines()[-n:]
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            print(line); continue
+        head = f"{e.get('ts','')[11:19]}"
+        if e.get("level") == "error":
+            print(f"{head}  ✗ {e.get('error')}")
+        elif e.get("level") == "suppressed":
+            why = {"quiet": "深夜静音", "away-too-long": "人不在"}.get(e.get("reason"), e.get("reason"))
+            print(f"{head}  · 没响（{why}）  {e.get('text')}")
+        else:
+            sink = e.get("sink", "?")
+            extra = " ⤵兜底" if e.get("fallback") else ""
+            if e.get("clamped_from"):
+                extra += f"（音量 {e['clamped_from']}→{e.get('volume')}）"
+            print(f"{head}  [{e.get('volume')}/{sink}{extra}] {e.get('text')}  ({e.get('audio_s')}s)")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 0
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    # `notify "一句话"` 这种直白调用最多，别逼人写子命令
+    if cmd in ("notify", "run", "status", "log", "presence", "--help", "-h"):
+        if cmd in ("--help", "-h"):
+            print(__doc__)
+            return 0
+        return {
+            "notify": lambda: cmd_notify(rest),
+            "run": lambda: cmd_run(rest),
+            "status": cmd_status,
+            "log": lambda: cmd_log(rest),
+            "presence": lambda: cmd_presence(rest),
+        }[cmd]()
+    return cmd_notify(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

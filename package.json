@@ -1,0 +1,33 @@
+{
+  "name": "dsh-speaker-notify",
+  "version": "0.1.0",
+  "description": "Speak through a DLNA speaker or the local sound card; auto-announce when DSH background jobs settle",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "files": [
+    "lib",
+    "daemon",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "tts",
+    "dlna",
+    "notification",
+    "kokoro"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  }
+}
