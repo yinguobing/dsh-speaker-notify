@@ -138,6 +138,18 @@ notify presence                       # 键鼠空闲多久（测量，不做决�
 notify log -n 20                      # 播报记录，含被压掉的
 ```
 
+## 播完要"松手"
+
+DLNA renderer 播完通常停在 `STOPPED`，但**媒体 URI 还挂着**。后果很具体（实测于华为 SOUND X）：
+
+- 音箱灯常亮，回不到原来的蓝牙源
+- 按音箱上的播放键，会把刚才那条通知再念一遍
+
+所以 `speakd` 在每次 DLNA 播放结束后（默认）做两件事：`Stop` + `SetAVTransportURI` 传空 URI，
+把媒体清掉。日志里 `released` 字段记录了清完之后的状态。
+
+不想要这个行为：`speakd.py --no-release`。
+
 ## 已知限制
 
 - **内存**：Kokoro + torch 常驻约 1.8GB RSS。CPU 上 RTF ≈ 0.36（4.9 秒音频生成 1.8 秒）。

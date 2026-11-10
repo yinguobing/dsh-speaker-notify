@@ -42,10 +42,17 @@ def log(entry: dict) -> None:
 class Speaker:
     """对客厅那台华为 SOUND X 的薄封装。复用 tools/dlna/soundx.py 的 SOAP 实现。"""
 
-    def __init__(self, soundx_dir: Path):
+    def __init__(self, soundx_dir: Path, endpoint: str = ""):
         sys.path.insert(0, str(soundx_dir))
         import soundx  # noqa: E402
 
+        # 把配置的音箱地址塞进传输层（它读 SOUNDX_HOST/SOUNDX_PORT 两个全局）
+        if endpoint:
+            host, _, port = endpoint.partition(":")
+            soundx.HOST = host
+            if port:
+                soundx.PORT = int(port)
+            soundx.BASE = f"{soundx.HOST}:{soundx.PORT}" if False else f"http://{soundx.HOST}:{soundx.PORT}"
         self._s = soundx
 
     def reachable(self) -> bool:
@@ -60,6 +67,30 @@ class Speaker:
 
     def play(self, url: str, title: str, duration: float | None) -> None:
         self._s.play_url(url, title=title, mime="audio/wav", duration=duration, keep=1.0)
+
+    def release(self) -> str:
+        """播完把媒体清掉，别让音箱攥着我们的 URL 不放。
+
+        不清理的后果（实测）：DLNA 放完停在 STOPPED 但 CurrentURI 还指着我们的 wav，
+        音箱的物理播放键会把刚才那条通知重播一遍，灯也常亮，蓝牙源回不去。
+        """
+        try:
+            self._s._soap("Stop", "<InstanceID>0</InstanceID>", self._s.AVT, "rendertransport1")
+        except SystemExit:
+            pass
+        try:
+            self._s._soap(
+                "SetAVTransportURI",
+                "<InstanceID>0</InstanceID><CurrentURI></CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
+                self._s.AVT, "rendertransport1",
+            )
+        except SystemExit as e:
+            return f"clear-uri failed: {e}"
+        try:
+            info = self._s._soap("GetTransportInfo", "<InstanceID>0</InstanceID>", self._s.AVT, "rendertransport1")
+            return self._s._field(info, "CurrentTransportState") or "unknown"
+        except SystemExit:
+            return "unknown"
 
 
 class Presence:
@@ -203,7 +234,7 @@ class Server:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         AUDIO_DIR.mkdir(parents=True, exist_ok=True)
         self.tts = Kokoro(cfg.voice, cfg.threads)
-        self.speaker = Speaker(Path(cfg.soundx_dir))
+        self.speaker = Speaker(Path(cfg.soundx_dir), cfg.speaker)
         self.local = LocalSink()
         self.presence = Presence(getattr(cfg, "present_window", 120))
         self.http = start_audio_server(AUDIO_DIR, cfg.audio_port)
@@ -280,9 +311,12 @@ class Server:
                     else:
                         self_ref.speaker.set_volume(volume)
                         self_ref.speaker.play(url, title="notify", duration=duration)
+                    state = "n/a"
+                    if target == "living" and self_ref.cfg.release:
+                        state = self_ref.speaker.release()
                     log({"level": "info", "text": text, "voice": voice, "volume": volume,
                          "sink": target, "fallback": attempt > 0,
-                         "clamped_from": clamped_from,
+                         "clamped_from": clamped_from, "released": state,
                          "synth_s": round(synth_seconds, 2), "audio_s": round(duration, 2)})
                     return
                 except Exception as e:
@@ -317,6 +351,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--socket", default=os.environ.get("SPEAKD_SOCKET", f"/run/user/{os.getuid()}/speakd.sock"))
     ap.add_argument("--voice", default="zm_055")
+    ap.add_argument("--no-release", dest="release", action="store_false",
+                    help="播完不要清空音箱的 URI（默认会清，避免播放键重播旧通知）")
     ap.add_argument("--present-window", type=float, default=300,
                     help="只用于 probe_presence 的测量口径，不影响播报决策")
     ap.add_argument("--max-volume", type=int, default=45)
